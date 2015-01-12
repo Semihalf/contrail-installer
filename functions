@@ -226,11 +226,19 @@ function get_default_host_ip() {
     local host_ip=$4
 
     # Find the interface used for the default route
-    host_ip_iface=${host_ip_iface:-$(ip route | sed -n '/^default/{ s/.*dev \(\w\+\)\s\+.*/\1/; p; }' | head -1)}
+    if is_freebsd; then
+        host_ip_iface=${host_ip_iface:-$(netstat -rn | grep default | awk '{print $6}')}
+    else
+        host_ip_iface=${host_ip_iface:-$(ip route | sed -n '/^default/{ s/.*dev \(\w\+\)\s\+.*/\1/; p; }' | head -1)}
+    fi
     # Search for an IP unless an explicit is set by ``HOST_IP`` environment variable
     if [ -z "$host_ip" -o "$host_ip" == "dhcp" ]; then
         host_ip=""
-        host_ips=`LC_ALL=C ip -f inet addr show ${host_ip_iface} | awk '/inet/ {split($2,parts,"/");  print parts[1]}'`
+        if is_freebsd; then
+            host_ips=$(ifconfig ${iface} | grep 'inet ' | cut -d' ' -f2)
+        else
+            host_ips=`LC_ALL=C ip -f inet addr show ${host_ip_iface} | awk '/inet/ {split($2,parts,"/");  print parts[1]}'`
+        fi
         for IP in $host_ips; do
             # Attempt to filter out IP addresses that are part of the fixed and
             # floating range. Note that this method only works if the ``netaddr``
@@ -254,6 +262,8 @@ function _get_package_dir() {
         pkg_dir=$FILES/apts
     elif is_fedora; then
         pkg_dir=$FILES/rpms
+    elif is_freebsd; then
+        pkg_dir=$FILES/pkg-freebsd
     elif is_suse; then
         pkg_dir=$FILES/rpms-suse
     else
@@ -410,6 +420,13 @@ GetOSVersion() {
         else
             os_CODENAME=""
         fi
+    elif [[ `uname -s` == "FreeBSD" ]]; then
+        os_VENDOR="FreeBSD"
+        os_RELEASE=$(uname -r)
+        os_UPDATE=${os_RELEASE##*.}
+        os_RELEASE=${os_RELEASE%.*}
+        os_PACKAGE="pkg"
+        os_CODENAME=""
     elif [[ -x $(which lsb_release 2>/dev/null) ]]; then
         os_VENDOR=$(lsb_release -i -s)
         os_RELEASE=$(lsb_release -r -s)
@@ -487,6 +504,9 @@ function GetDistro() {
     elif [[ "$os_VENDOR" =~ (Fedora) ]]; then
         # For Fedora, just use 'f' and the release
         DISTRO="f$os_RELEASE"
+    elif [[ "$os_VENDOR" =~ (FreeBSD) ]]; then
+        # For FreeBSD, just use 'freebsd' and the release
+        DISTRO="freebsd$os_RELEASE"
     elif [[ "$os_VENDOR" =~ (openSUSE) ]]; then
         DISTRO="opensuse-$os_RELEASE"
     elif [[ "$os_VENDOR" =~ (SUSE LINUX) ]]; then
@@ -520,6 +540,25 @@ function is_fedora {
     [ "$os_VENDOR" = "Fedora" ] || [ "$os_VENDOR" = "Red Hat" ] || [ "$os_VENDOR" = "CentOS" ]
 }
 
+# Determine if current distribution is FreeBSD
+# is_freebsd
+function is_freebsd {
+    if [[ -z "$os_VENDOR" ]]; then
+        GetOSVersion
+    fi
+
+    [ "$os_VENDOR" = "FreeBSD" ]
+}
+
+# On FreeBSD prepend '/usr/local' to all the '/etc' strings. On non-BSD systems
+# set the prefix empty.
+function get_install_prefix() {
+    if is_freebsd; then
+        echo "/usr/local"
+    else
+        echo ""
+    fi
+}
 
 # Determine if current distribution is a SUSE-based distribution
 # (openSUSE, SLE).
@@ -692,7 +731,13 @@ function inicomment() {
     local file=$1
     local section=$2
     local option=$3
-    sed -i -e "/^\[$section\]/,/^\[.*\]/ s|^\($option[ \t]*=.*$\)|#\1|" "$file"
+    local sed_re='/^\[$section\]/,/^\[.*\]/ s|^\($option[ \t]*=.*$\)|#\1|'
+
+    if is_freebsd; then
+        sed -i '' -e "$sed_re" "$file"
+    else
+        sed -i -e "$sed_re" "$file"
+    fi
 }
 
 
@@ -702,7 +747,12 @@ function iniuncomment() {
     local file=$1
     local section=$2
     local option=$3
-    sed -i -e "/^\[$section\]/,/^\[.*\]/ s|[^ \t]*#[ \t]*\($option[ \t]*=.*$\)|\1|" "$file"
+    local sed_re="/^\[$section\]/,/^\[.*\]/ s|[^ \t]*#[ \t]*\($option[ \t]*=.*$\)|\1|"
+    if is_freebsd; then
+        sed -i '' -e "$sed_re" "$file"
+    else
+        sed -i -e "$sed_re" "$file"
+    fi
 }
 
 
@@ -746,13 +796,23 @@ function iniset() {
     fi
     if ! ini_has_option "$file" "$section" "$option"; then
         # Add it
-        sed -i -e "/^\[$section\]/ a\\
+        if is_freebsd; then
+            sed -i '' -e "/^\[$section\]/ a\\
 $option = $value
 " "$file"
+        else
+            sed -i -e "/^\[$section\]/ a\\
+$option = $value
+" "$file"
+        fi
     else
         local sep=$(echo -ne "\x01")
         # Replace it
-        sed -i -e '/^\['${section}'\]/,/^\[.*\]/ s'${sep}'^\('${option}'[ \t]*=[ \t]*\).*$'${sep}'\1'"${value}"${sep} "$file"
+        if is_freebsd; then
+            sed -i '' -e '/^\['${section}'\]/,/^\[.*\]/ s'${sep}'^\('${option}'[ \t]*=[ \t]*\).*$'${sep}'\1'"${value}"${sep} "$file"
+        else
+            sed -i -e '/^\['${section}'\]/,/^\[.*\]/ s'${sep}'^\('${option}'[ \t]*=[ \t]*\).*$'${sep}'\1'"${value}"${sep} "$file"
+        fi
     fi
 }
 
@@ -788,13 +848,24 @@ function iniset_multiline() {
         echo -e "\n[$section]" >>"$file"
     else
         # Remove old values
-        sed -i -e "/^\[$section\]/,/^\[.*\]/ { /^$option[ \t]*=/ d; }" "$file"
+        local sed_re="/^\[$section\]/,/^\[.*\]/ { /^$option[ \t]*=/ d; }"
+        if is_freebsd; then
+            sed -i '' -e "$sed_re" "$file"
+        else
+            sed -i -e "$sed_re" "$file"
+        fi
     fi
     # Add new ones
     for v in $values; do
-        sed -i -e "/^\[$section\]/ a\\
+        if is_freebsd; then
+            sed -i '' -e "/^\[$section\]/ a\\
 $option = $v
 " "$file"
+        else
+            sed -i -e "/^\[$section\]/ a\\
+$option = $v
+" "$file"
+        fi
     done
 }
 
@@ -963,6 +1034,8 @@ function install_package() {
         apt_get install "$@"
     elif is_fedora; then
         yum_install "$@"
+    elif is_freebsd; then
+        sudo pkg install -y "$@"
     elif is_suse; then
         zypper_install "$@"
     else
@@ -978,6 +1051,8 @@ function uninstall_package() {
         apt_get purge "$@"
     elif is_fedora; then
         sudo yum remove -y "$@"
+    elif is_freebsd; then
+        sudo pkg delete -y "$@"
     elif is_suse; then
         sudo zypper rm "$@"
     else
@@ -1001,6 +1076,8 @@ function is_package_installed() {
         dpkg -s "$@" > /dev/null 2> /dev/null
     elif [[ "$os_PACKAGE" = "rpm" ]]; then
         rpm --quiet -q "$@"
+    elif [[ "$os_PACKAGE" = "pkg" ]]; then
+        pkg info "$@" > /dev/null 2> /dev/null
     else
         exit_distro_not_supported "finding if a package is installed"
     fi
@@ -1047,7 +1124,12 @@ function pip_install {
     # 1.1, the existing extracted build will be used and cause
     # confusing errors.  By creating unique build directories we avoid
     # this problem. See https://github.com/pypa/pip/issues/709
-    local pip_build_tmp=$(mktemp --tmpdir -d pip-build.XXXXX)
+    # FreeBSD does not understand the --tempdir flag
+    if is_freebsd; then    
+      local pip_build_tmp=$(mktemp -d /tmp/pip-build.XXXXX)
+    else
+     local pip_build_tmp=$(mktemp --tmpdir -d pip-build.XXXXX)
+    fi
 
     $SUDO_PIP PIP_DOWNLOAD_CACHE=${PIP_DOWNLOAD_CACHE:-/var/cache/pip} \
         HTTP_PROXY=$http_proxy \
@@ -1071,8 +1153,8 @@ function cleanup_tmp {
 # Service wrapper to restart services
 # restart_service service-name
 function restart_service() {
-    if is_ubuntu; then
-        sudo /usr/sbin/service $1 restart
+    if is_ubuntu || is_freebsd; then
+        sudo /usr/sbin/service $1 onerestart
     else
         sudo /sbin/service $1 restart
     fi
@@ -1284,6 +1366,10 @@ function service_check() {
 
 # Returns true if the directory is on a filesystem mounted via NFS.
 function is_nfs_directory() {
+    if is_freebsd; then
+        (df -t nfs "$@" > /dev/null 2> /dev/null)
+        return $?
+    fi
     local mount_type=`stat -f -L -c %T $1`
     test "$mount_type" == "nfs"
 }
@@ -1384,7 +1470,7 @@ function setup_develop_no_requirements_update() {
 # Service wrapper to start services
 # start_service service-name
 function start_service() {
-    if is_ubuntu; then
+    if is_ubuntu || is_freebsd; then
         sudo /usr/sbin/service $1 start
     else
         sudo /sbin/service $1 start
@@ -1395,7 +1481,7 @@ function start_service() {
 # Service wrapper to stop services
 # stop_service service-name
 function stop_service() {
-    if is_ubuntu; then
+    if is_ubuntu || is_freebsd; then
         sudo /usr/sbin/service $1 stop
     else
         sudo /sbin/service $1 stop
@@ -1847,8 +1933,10 @@ function add_user_to_group() {
         GetOSVersion
     fi
 
+    if is_freebsd; then
+        sudo pw groupmod "$group" -m "$user"
     # SLE11 and openSUSE 12.2 don't have the usual usermod
-    if ! is_suse || [[ "$os_VENDOR" = "openSUSE" && "$os_RELEASE" != "12.2" ]]; then
+    elif ! is_suse || [[ "$os_VENDOR" = "openSUSE" && "$os_RELEASE" != "12.2" ]]; then
         sudo usermod -a -G "$group" "$user"
     else
         sudo usermod -A "$group" "$user"
@@ -1900,8 +1988,16 @@ function check_path_perm_sanity() {
     local rebuilt_path=""
     for i in $(echo ${real_path} | tr "/" " "); do
         rebuilt_path=$rebuilt_path"/"$i
+        
+        local statperm=""
+        if is_freebsd; then
+            statperm="$(stat -f "%p" ${rebuilt_path})"
+            statperm="${statperm: -3}"
+        else
+            statperm="$(stat -c '%a' ${rebuilt_path})"
+        fi
 
-        if [[ $(stat -c '%a' ${rebuilt_path}) = 700 ]]; then
+        if [[ $statperm = 700 ]]; then
             echo "*** DEST path element"
             echo "***    ${rebuilt_path}"
             echo "*** appears to have 0700 permissions."

@@ -8,6 +8,19 @@ if [[ $EUID -eq 0 ]]; then
     echo "Cut it out."
     exit 1
 fi
+
+# (woz@semihalf.com) Did this for debugging purposes.
+if [[ ! -f localrc ]]; then
+    while true; do
+        read -p "There is no localrc file present. Do you wish to continue anyway? (y/n)" yn
+        case $yn in
+            [Yy]* ) break;;
+            [Nn]* ) exit 1;;
+            * ) echo "Please answer yes or no.";;
+        esac
+    done
+fi
+
 if [[ "$CONTRAIL_DEFAULT_INSTALL" != "True" ]]; then
     ENABLED_SERVICES=redis,cass,zk,ifmap,disco,apiSrv,schema,svc-mon,control,collector,analytics-api,query-engine,agent,redis-w,ui-jobs,ui-webs
 else
@@ -23,6 +36,10 @@ source localrc
 # ``os_RELEASE``, ``os_UPDATE``, ``os_PACKAGE``, ``os_CODENAME``
 # and ``DISTRO``
 GetDistro
+
+# (woz@semihalf.com) On FreeBSD prepend '/usr/local' to all the '/etc' strings.
+# On non-BSD systems set the prefix empty.
+INSTALL_PREFIX=$(get_install_prefix)
 
 BS_FL_CONTROLLERS_PORT=${BS_FL_CONTROLLERS_PORT:-localhost:80}
 BS_FL_OF_PORT=${BS_FL_OF_PORT:-6633}
@@ -74,8 +91,11 @@ function setup_root_access {
     is_package_installed sudo || install_package sudo
 
     # UEC images ``/etc/sudoers`` does not have a ``#includedir``, add one
-    sudo grep -q "^#includedir.*/etc/sudoers.d" /etc/sudoers ||
-        echo "#includedir /etc/sudoers.d" | sudo tee -a /etc/sudoers
+    local etc_sudoers="$INSTALL_PREFIX/etc/sudoers"
+    local etc_sudoers_d="$INSTALL_PREFIX/etc/sudoers.d"
+
+    sudo grep -q "^#includedir.*$etc_sudoers_d" $etc_sudoers ||
+        echo "#includedir $etc_sudoers_d" | sudo tee -a $etc_sudoers
 
     # Set up devstack sudoers
     TEMPFILE=`mktemp`
@@ -84,8 +104,12 @@ function setup_root_access {
     # see them by forcing PATH
     echo "Defaults:$CONTRAIL_USER secure_path=/sbin:/usr/sbin:/usr/bin:/bin:/usr/local/sbin:/usr/local/bin" >> $TEMPFILE
     chmod 0440 $TEMPFILE
-    sudo chown root:root $TEMPFILE
-    sudo mv $TEMPFILE /etc/sudoers.d/50_contrail_sh
+    if is_freebsd; then
+        sudo chown root:wheel $TEMPFILE
+    else
+        sudo chown root:root $TEMPFILE
+    fi
+    sudo mv $TEMPFILE "$etc_sudoers_d/50_contrail_sh"
 
 }
 
@@ -312,6 +336,65 @@ function download_dependencies {
             apt_get install python-kombu
         fi
         apt_get install python-sphinx
+    elif is_freebsd; then
+        install_package net/py-novaclient
+        install_package patch
+        install_package scons
+        install_package flex
+        install_package bison
+        install_package vim
+        install_package unzip
+        install_package autoconf
+        install_package automake
+        install_package libtool
+        install_package curl
+        install_package screen
+        install_package debhelper
+        install_package gmake
+        install_package libxml2
+        install_package libxslt
+        install_package expat
+        install_package gettext
+        # (woz@semihalf.com): Currently (2014-09-04) gcc 4.7 is default installed with pkg install gcc,
+        # so this is the version I use to develop the script. Versions 4.8 or 4.9
+        # may not be compatibile with contrail.
+        # install_package gcc
+        install_package gcc47
+        install_package python2
+        install_package libevent2
+        install_package libvirt
+        install_package devel/py-lxml
+        install_package databases/py-redis
+        install_package apache-ant
+        install_package java/openjdk7
+        install_package log4j
+        install_package devel/pkgconf
+        install_package gnupg
+        install_package protobuf
+        install_package netmask
+        install_package devel/py-pip
+        install_package wget
+        # (woz@semihalf.com): I did not find equivalent packages for:
+        # uml-utilities
+        # python-software-properties
+        # python-jsonpickle
+        # chkconfig
+        # javahelper
+        # libcommons-codec-java libhttpcore-java
+        # linux-headers-$(uname -r)
+
+        # (woz@semihalf.com): FreeBSD keeps gcc and g++ in /usr/local/bin/gcc[version] and g++[version]
+        # which is why scons has a problem to find them. To solve the problem
+        # symlinks are created. There is probably a better, version-independent way
+        # to deal with it without interfering with user's symlinks.
+        sudo ln -s /usr/local/bin/gcc47 /usr/local/bin/gcc
+        sudo ln -s /usr/local/bin/g++47 /usr/local/bin/g++
+
+        # Prevent missing certificates making repo init impossible
+        install_package ca_root_nss-3.17.3_1
+        if [ ! -f /etc/ssl/cert.pem ]; then
+            sudo ln -s /usr/local/share/certs/ca-root-nss.crt /etc/ssl/cert.pem
+        fi
     else
         sudo yum -y install patch scons flex bison make vim
         sudo yum -y install expat-devel gettext-devel curl-devel
@@ -525,8 +608,18 @@ function build_contrail() {
         change_stage "started" "Dependencies"
     fi
    
-    source install_pip.sh
-    /bin/bash install_pip.sh
+    # (woz@semihalf.com): On FreeBSD user needs to install pip manually due to conflict
+    # with pip from pkg package and one downloaded by install_pip.sh.
+    # The execution stops when install_pip.sh finds there is pip installed
+    # but cannot remove it with pkg delete, because it was not installed
+    # with pkg install. The solution is to make sure pip is installed before
+    # running contrail.sh.
+    if is_freebsd; then
+        :
+    else
+        source install_pip.sh
+        /bin/bash install_pip.sh
+    fi
         
     if [[ $(read_stage) == "Dependencies" ]]; then
         download_python_dependencies
@@ -549,6 +642,15 @@ function build_contrail() {
         fi
    
         if [[ $(read_stage) == "repo-init" ]]; then
+            if is_freebsd; then
+                if [[ -f $TOP_DIR/local_manifest.xml ]]; then
+                    echo "Local manifest found. Copying to $CONTRAIL_SRC/.repo/local_manifest.xml"
+                    cp $TOP_DIR/local_manifest.xml $CONTRAIL_SRC/.repo/local_manifest.xml
+                else
+                    echo "Local manifest file was not found."
+                fi
+            fi
+
             repo sync
             [[ $? -ne 0 ]] && echo "repo sync failed" && exit
             change_stage "repo-init" "repo-sync"
@@ -571,9 +673,21 @@ function build_contrail() {
             fi
         elif [ "$INSTALL_PROFILE" = "COMPUTE" ]; then
             if [[ $(read_stage) == "fetch-packages" ]]; then
-                sudo scons --opt=production controller/src/vnsw
-                sudo scons --opt=production vrouter
-                sudo scons --opt=production openstack/nova_contrail_vif
+                if is_freebsd; then
+                    # (woz@semihalf.com): We need to build ICU libraries first and propagate their location.
+                    sudo scons controller/lib/icu
+                    sudo bash -c "echo "$CONTRAIL_SRC/build/lib" > /usr/local/libdata/ldconfig/contrail-icu"
+                    sudo /etc/rc.d/ldconfig restart
+
+                    # (woz@semihalf.com): Add --opt=production and remove -i when it's possible
+                    sudo scons -i controller/src/vnsw/agent
+                    sudo scons vrouter
+                    sudo scons openstack/nova_contrail_vif
+                else
+                    sudo scons --opt=production controller/src/vnsw
+                    sudo scons --opt=production vrouter
+                    sudo scons --opt=production openstack/nova_contrail_vif
+                fi
                 ret_val=$?
                 [[ $ret_val -ne 0 ]] && exit
                 change_stage "fetch-packages" "Build"          
@@ -615,7 +729,10 @@ function install_contrail() {
 
                 # install contrail modules
                 echo "Installing contrail modules"
-                pip_install --upgrade $(find $CONTRAIL_SRC/build/production -name "*.tar.gz" -print)
+                # (woz@semihalf.com): for debugging purposes production -> debug
+                #pip_install --upgrade $(find $CONTRAIL_SRC/build/production -name "*.tar.gz" -print)
+                pip_install --upgrade $(find $CONTRAIL_SRC/build/debug -name "*.tar.gz" -print)
+
 
                 # install VIF driver
                 pip_install $CONTRAIL_SRC/build/noarch/nova_contrail_vif/dist/nova_contrail_vif*.tar.gz
@@ -684,16 +801,24 @@ function install_contrail() {
     elif [ "$INSTALL_PROFILE" = "COMPUTE" ]; then
         if [[ $(read_stage) == "Build" ]] || [[ $(read_stage) == "install" ]]; then
             if [[ "$CONTRAIL_DEFAULT_INSTALL" != "True" ]]; then
-                sudo scons --opt=production --root=/ controller/src/vnsw install
-                sudo scons --opt=production --root=/ vrouter install
-                sudo scons --opt=production --root=/ openstack/nova_contrail_vif install
+                # (woz@semihalf.com): add install support in future
+                if is_freebsd; then
+                    :
+                else
+                    sudo scons --opt=production --root=/ controller/src/vnsw install
+                    sudo scons --opt=production --root=/ vrouter install
+                    sudo scons --opt=production --root=/ openstack/nova_contrail_vif install
+                fi
                 ret_val=$?
                 [[ $ret_val -ne 0 ]] && exit
                 cd ${contrail_cwd}
 
                 # install contrail modules
                 echo "Installing contrail modules"
-                pip_install --upgrade $(find $CONTRAIL_SRC/build/production -name "*.tar.gz" -print)
+                # (woz@semihalf.com): for debugging purposes production -> debug
+                #pip_install --upgrade $(find $CONTRAIL_SRC/build/production -name "*.tar.gz" -print)
+                pip_install --upgrade $(find $CONTRAIL_SRC/build/debug -name "*.tar.gz" -print)
+
 
                 # install VIF driver
                 pip_install $CONTRAIL_SRC/build/noarch/nova_contrail_vif/dist/nova_contrail_vif*.tar.gz
@@ -740,28 +865,41 @@ function apply_patch() {
 }
 
 function test_install_cassandra_patch() { 
-    apply_patch $TOP_DIR/cassandra-env.sh.patch /etc/cassandra sudo
+    apply_patch $TOP_DIR/cassandra-env.sh.patch $INSTALL_PREFIX/etc/cassandra sudo
 }
 
 # take over physical interface
 function insert_vrouter() {
-    source /etc/contrail/contrail-compute.conf
+    # (woz@semihalf.com): for get_Mask(), get_management_ip(), get_Mac().
+    source contrail_config_functions
+
+    source $INSTALL_PREFIX/etc/contrail/contrail-compute.conf
     EXT_DEV=$dev
     if [ -e $VHOST_CFG ]; then
 	source $VHOST_CFG
     else
 	DEVICE=vhost0
-	IPADDR=$(sudo ifconfig $EXT_DEV | sed -ne 's/.*inet *addr[: ]*\([0-9.]*\).*/\1/i p')
-	NETMASK=$(sudo ifconfig $EXT_DEV | sed -ne 's/.*mask[: *]\([0-9.]*\).*/\1/i p')
+    # (woz@semihalf.com): why sed here, while we have functions for that?
+    IPADDR=$(get_management_ip $EXT_DEV)
+    NETMASK=$(get_Mask $EXT_DEV)
+	# IPADDR=$(sudo ifconfig $EXT_DEV | sed -ne 's/.*inet *addr[: ]*\([0-9.]*\).*/\1/i p')
+	# NETMASK=$(sudo ifconfig $EXT_DEV | sed -ne 's/.*mask[: *]\([0-9.]*\).*/\1/i p')
     fi
     # don't die in small memory environments
     if [[ "$CONTRAIL_DEFAULT_INSTALL" != "True" ]]; then
-        sudo insmod $CONTRAIL_SRC/vrouter/$kmod vr_flow_entries=4096 vr_oflow_entries=512
+        if is_freebsd; then
+            sudo kldload -n $CONTRAIL_SRC/vrouter/freebsd/$kmod
+        else
+            sudo insmod $CONTRAIL_SRC/vrouter/$kmod vr_flow_entries=4096 vr_oflow_entries=512
+        fi
+
         if [[ $? -eq 1 ]] ; then 
             exit 1
         fi
         echo "Creating vhost interface: $DEVICE."
-        VIF=$CONTRAIL_SRC/build/production/vrouter/utils/vif
+        # (woz@semihalf.com): for debugging purposes production -> debug
+        # VIF=$CONTRAIL_SRC/build/production/vrouter/utils/vif
+        VIF=$CONTRAIL_SRC/build/debug/vrouter/utils/vif
     else    
         vrouter_pkg_version=$(zless /usr/share/doc/contrail-vrouter-agent/changelog.gz )
         vrouter_pkg_version=${vrouter_pkg_version#* (*}
@@ -774,7 +912,9 @@ function insert_vrouter() {
         VIF=/usr/bin/vif
     fi 
     
-    DEV_MAC=$(cat /sys/class/net/$dev/address)
+    # (woz@semihalf.com): there's a function for that.
+    DEV_MAC=$(get_Mac $dev)
+    # DEV_MAC=$(cat /sys/class/net/$dev/address)
     sudo $VIF --create $DEVICE --mac $DEV_MAC \
         || echo "Error creating interface: $DEVICE"
 
@@ -818,6 +958,31 @@ END { @dns && print(" dns-nameservers ", join(" ", @dns), "\n") }' /etc/resolv.c
 	echo "Sleeping 10 seconds to allow link state to settle"
 	sleep 10
 	sudo ifup -i /tmp/interfaces $dev
+    elif is_freebsd; then
+        sudo ifconfig $dev promisc
+
+        ip=$(get_management_ip $dev)
+        mask=$(get_Mask $dev)
+        broadcast=$(get_broadcast $dev)
+        dns_ips=$(get_dns_servers)
+        gateway=$(find_gateway $dev)
+        resolv_conf=$(mktemp resolv.conf.XXX)
+        cp /etc/resolv.conf $resolv_conf
+
+        echo "Removing address from $dev"
+        sudo ifconfig $dev inet 0.0.0.0
+        sleep 5
+
+        echo "Configuring $DEVICE"
+        sudo ifconfig $DEVICE inet $ip netmask $mask broadcast $broadcast
+        sudo ifconfig $DEVICE up
+        sleep 5
+        sudo ifconfig $dev up
+        sudo route add default $gateway
+
+        echo "Restoring resolv.conf"
+        sudo cp $resolv_conf /etc/resolv.conf
+        rm -f $resolv_conf
     else
 	echo "Sleeping 10 seconds to allow link state to settle"
 	sudo ifup $DEVICE
@@ -830,11 +995,19 @@ END { @dns && print(" dns-nameservers ", join(" ", @dns), "\n") }' /etc/resolv.c
 
 function test_insert_vrouter ()
 {
-    if lsmod | grep -q vrouter; then 
-	echo "vrouter module already inserted."
+    if is_freebsd; then
+        kldstat | grep -q vrouter
+        local is_vrouter_not_inserted=$?
     else
-	insert_vrouter
-	echo "vrouter kernel module inserted."
+        lsmod | grep -q vrouter
+        local is_vrouter_not_inserted=$?
+    fi
+
+    if [[ $is_vrouter_not_inserted -eq 0 ]]; then
+        echo "vrouter module already inserted."
+    else
+        insert_vrouter
+        echo "vrouter kernel module inserted."
     fi
 }
 
@@ -856,7 +1029,7 @@ function start_contrail() {
     
     mkdir -p $TOP_DIR/status/contrail/ 
     pid_count=`ls $TOP_DIR/status/contrail/*.pid|wc -l`
-    if [[ $pid_count != 0 ]]; then
+    if [[ $pid_count -ne 0 ]]; then
         echo "contrail is already running to restart use contrail.sh stop and contrail.sh start"
         exit 
     fi
@@ -958,16 +1131,22 @@ function start_contrail() {
 
     # agent
     if [ $CONTRAIL_VGW_INTERFACE -a $CONTRAIL_VGW_PUBLIC_SUBNET -a $CONTRAIL_VGW_PUBLIC_NETWORK ]; then
-        sudo sysctl -w net.ipv4.ip_forward=1
+        if is_freebsd; then
+            sudo sysctl -w net.inet.ip.forwarding=1
+        else
+            sudo sysctl -w net.ipv4.ip_forward=1
+        fi
         if [[ "$CONTRAIL_DEFAULT_INSTALL" != "True" ]]; then
-            sudo $CONTRAIL_SRC/build/production/vrouter/utils/vif --create vgw --mac 00:01:00:5e:00:00
+            # (woz@semihalf.com): for debugging purposes production -> debug
+            # sudo $CONTRAIL_SRC/build/production/vrouter/utils/vif --create vgw --mac 00:01:00:5e:00:00
+            sudo $CONTRAIL_SRC/build/debug/vrouter/utils/vif --create vgw --mac 00:01:00:5e:00:00
         else
             sudo /usr/bin/vif --create vgw --mac 00:01:00:5e:00:00
         fi            
         sudo ifconfig vgw up
         sudo route add -net $CONTRAIL_VGW_PUBLIC_SUBNET dev vgw
     fi
-    source /etc/contrail/contrail-compute.conf
+    source $INSTALL_PREFIX/etc/contrail/contrail-compute.conf
     #sudo mkdir -p $(dirname $VROUTER_LOGFILE)
     mkdir -p $TOP_DIR/bin
     
@@ -987,10 +1166,11 @@ EOF2
     chmod a+x $TOP_DIR/bin/contrail-version
     
     if [[ "$CONTRAIL_DEFAULT_INSTALL" != "True" ]]; then
+        # (woz@semihalf.com): for debugging purposes production -> debug in vnsw.hlpr
         cat > $TOP_DIR/bin/vnsw.hlpr <<END
 #! /bin/bash
 PATH=$TOP_DIR/bin:$PATH
-LD_LIBRARY_PATH=$CONTRAIL_SRC/build/lib $CONTRAIL_SRC/build/production/vnsw/agent/contrail/contrail-vrouter-agent --config_file=/etc/contrail/contrail-vrouter-agent.conf --DEFAULT.log_file=/var/log/vrouter.log 
+LD_LIBRARY_PATH=$CONTRAIL_SRC/build/lib $CONTRAIL_SRC/build/debug/vnsw/agent/contrail/contrail-vrouter-agent --config_file=$INSTALL_PREFIX/etc/contrail/contrail-vrouter-agent.conf --DEFAULT.log_file=/var/log/vrouter.log 
 END
   
     else
@@ -1001,6 +1181,12 @@ LD_LIBRARY_PATH=/usr/lib /usr/bin/contrail-vrouter-agent --config_file=/etc/cont
 END
     fi
     chmod a+x $TOP_DIR/bin/vnsw.hlpr
+
+    # agent creates a tap device, so the module is needed
+    if is_freebsd; then
+        sudo kldload if_tap
+    fi
+
     screen_it agent "sudo $TOP_DIR/bin/vnsw.hlpr"
 
     # set up a proxy route in contrail from 169.254.169.254:80 to
@@ -1065,12 +1251,12 @@ function configure_contrail() {
     # )
 
     #defaults loading
-    sudo mkdir -p /etc/contrail
-    sudo mkdir -p /etc/sysconfig/network-scripts    
-    sudo chown -R `whoami` /etc/contrail
-    sudo chmod  664 /etc/contrail/*
-    sudo chown -R `whoami` /etc/sysconfig/network-scripts
-    sudo chmod  664 /etc/sysconfig/network-scripts/*
+    sudo mkdir -p $INSTALL_PREFIX/etc/contrail
+    sudo mkdir -p $INSTALL_PREFIX/etc/sysconfig/network-scripts    
+    sudo chown -R `whoami` $INSTALL_PREFIX/etc/contrail
+    sudo chmod  664 $INSTALL_PREFIX/etc/contrail/*
+    sudo chown -R `whoami` $INSTALL_PREFIX/etc/sysconfig/network-scripts
+    sudo chmod  664 $INSTALL_PREFIX/etc/sysconfig/network-scripts/*
     cd $TOP_DIR  
     
     #un-comment if required after review
@@ -1120,6 +1306,10 @@ function clean_contrail() {
 }
 
 function stop_contrail() {
+    source contrail_config_functions
+    source $INSTALL_PREFIX/etc/contrail/contrail-compute.conf
+
+    DEVICE=vhost0
     SAVED_SCREEN_NAME=$SCREEN_NAME
     SCREEN_NAME="contrail"
     SCREEN=$(which screen)
@@ -1129,7 +1319,12 @@ function stop_contrail() {
             screen -X -S $SESSION quit
         fi
     fi
-    (cd $CONTRAIL_SRC/third_party/zookeeper-3.4.6; ./bin/zkServer.sh stop)
+
+    if is_freebsd; then
+        :
+    else
+        (cd $CONTRAIL_SRC/third_party/zookeeper-3.4.6; ./bin/zkServer.sh stop)
+    fi
     echo_summary "-----------------------STOPPING CONTRAIL--------------------------"
     if [ "$INSTALL_PROFILE" = "ALL" ]; then
         screen_stop redis
@@ -1150,19 +1345,43 @@ function stop_contrail() {
     fi
     screen_stop agent  
     rm $CONTRAIL_DIR/status/contrail/*.failure /dev/null 2>&1
-    cmd=$(lsmod | grep vrouter)
+    if is_freebsd; then
+        cmd=$(kldstat | grep vrouter)
+    else
+        cmd=$(lsmod | grep vrouter)
+    fi
     if [ $? == 0 ]; then
-        cmd=$(sudo rmmod vrouter)
+        if is_freebsd; then
+            echo "Restoring $DEVICE settings to $dev interface before removing kernel module"
+            ip=$(get_management_ip $DEVICE)
+            mask=$(get_Mask $DEVICE)
+            broadcast=$(get_broadcast $DEVICE)
+            dns_ips=$(get_dns_servers)
+            gateway=$(find_gateway $DEVICE)
+            resolv_conf=$(mktemp resolv.conf.XXX)
+            cp /etc/resolv.conf $resolv_conf
+
+            cmd=$(sudo kldunload vrouter)
+
+            sudo ifconfig $dev inet $ip netmask $mask broadcast $broadcast
+            sudo route add default $gateway
+            sudo ifconfig $dev up
+
+            echo "Restoring resolv.conf"
+            sudo cp $resolv_conf /etc/resolv.conf
+            rm -f $resolv_conf
+        else
+            cmd=$(sudo rmmod vrouter)
+        fi
         if [ $? == 0 ]; then
-            source /etc/contrail/contrail-compute.conf
             if is_ubuntu; then
                 sudo ifdown  $dev
                 sudo ifup    $dev
                 sudo ifdown vhost0
                 
             else
-                sudo rm -f /etc/sysconfig/network-scripts/ifcfg-$dev
-                sudo rm -f /etc/sysconfig/network-scripts/ifcfg-vhost0
+                sudo rm -f $INSTALL_PREFIX/etc/sysconfig/network-scripts/ifcfg-$dev
+                sudo rm -f $INSTALL_PREFIX/etc/sysconfig/network-scripts/ifcfg-vhost0
             fi
         fi
     fi
@@ -1170,7 +1389,11 @@ function stop_contrail() {
         sudo route del -net $CONTRAIL_VGW_PUBLIC_SUBNET dev vgw
     fi
     if [ $CONTRAIL_VGW_INTERFACE ]; then
-        sudo tunctl -d vgw
+        if is_freebsd; then
+            sudo ifconfig vgw destroy
+        else
+            sudo tunctl -d vgw
+        fi
     fi
     # restore saved screen settings
     SCREEN_NAME=$SAVED_SCREEN_NAME
@@ -1247,5 +1470,3 @@ else
     # Force all output to stdout now
     exec 1>&3
 fi
-
-
